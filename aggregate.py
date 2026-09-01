@@ -242,7 +242,8 @@ def aggregate_folder(run_dir: Path, teams: list[dict] | None = None) -> dict:
 
     results, errors = [], []
     for f in sorted(run_dir.glob("progress_*.xlsx")):
-        m = re.match(r"progress_(.+?)_(\d{8})\.xlsx$", f.name)
+        # progress_<작업반>_<기간라벨>.xlsx — 라벨은 20260831 / 202608 / 20260801-20260815
+        m = re.match(r"progress_(.+?)_(\d{6,8}(?:-\d{8})?)\.xlsx$", f.name)
         code = m.group(1) if m else f.stem
         try:
             results.append(aggregate_team(f, code, name_map.get(code, "")))
@@ -271,12 +272,12 @@ def aggregate_folder(run_dir: Path, teams: list[dict] | None = None) -> dict:
     return {"run_dir": run_dir, "teams": results, "total": total, "errors": errors}
 
 
-def summary_text(agg: dict, target_date: str = "") -> str:
-    """콘솔/GUI 용 한 눈 요약."""
+def summary_text(agg: dict, target_date: str = "", kind: str = "일마감") -> str:
+    """콘솔/GUI 용 한 눈 요약. kind = 일마감 / 월마감 / 기간."""
     t = agg["total"]
     lines = []
     if target_date:
-        lines.append(f"■ 대상일자 {target_date} (일마감)")
+        lines.append(f"■ {kind} · 개시예정일 {target_date}")
     lines.append(f"{'작업반':<14}{'50진행':>7}{'80완료':>7}{'모수':>7}{'진행률':>9}{'30제외':>8}")
     lines.append("-" * 54)
     for r in agg["teams"]:

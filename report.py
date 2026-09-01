@@ -58,10 +58,10 @@ def _sheet_summary(wb, agg: dict, target_date: str, meta: dict):
     ws = wb.create_sheet("일마감요약")
     ws.sheet_view.showGridLines = False
 
-    ws["A1"] = "공정진척현황(작업보고) 일마감 보고서"
+    ws["A1"] = f"공정진척현황(작업보고) {meta.get('kind', '일마감')} 보고서"
     ws["A1"].font = TITLE_FONT
     ws.merge_cells("A1:I1")
-    ws["A2"] = (f"대상일자 {target_date}   |   iERP PM60250Rv3   |   "
+    ws["A2"] = (f"개시예정일 {target_date}   |   iERP PM60250Rv3   |   "
                 f"생성 {datetime.datetime.now():%Y-%m-%d %H:%M}")
     ws["A2"].font = SUB_FONT
     ws.merge_cells("A2:I2")

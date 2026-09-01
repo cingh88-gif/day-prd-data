@@ -1,11 +1,16 @@
 r"""
-일마감 원샷 실행 — **수집 → 집계 → 보고서** 한 번에. 스케줄러가 부르는 진입점.
+일·월 마감 원샷 실행 — **수집 → 집계 → 보고서** 한 번에. 스케줄러가 부르는 진입점.
 
-  py run_daily.py                    # 전날치 수집 + 보고서
-  py run_daily.py --date 2026-08-31  # 특정일
-  py run_daily.py --no-collect       # 이미 받아 둔 폴더로 **집계·보고서만** 다시
-  py run_daily.py --auto             # 스케줄러용(로그 파일에 기록, 보고서 자동열기 안 함)
+  py run_daily.py                          # 전날치(일마감)
+  py run_daily.py --date 2026-08-31        # 특정 하루
+  py run_daily.py --month 2026-08          # ★ 그 달 전체(월마감)
+  py run_daily.py --last-month             # ★ 전월 전체 — 월마감 스케줄이 쓰는 형태
+  py run_daily.py --from 2026-08-01 --to 2026-08-15   # 직접 기간
+  py run_daily.py --teams M2105,M1101      # 일부 작업반만(시험용)
+  py run_daily.py --no-collect --month 2026-08        # 받아 둔 폴더로 집계·보고서만 다시
+  py run_daily.py --auto                   # 스케줄러용(보고서 자동열기 안 함)
 
+기간은 화면의 **개시예정일** 에 들어간다(작업일자·보고일자가 아니다).
 --no-collect 는 WSL 에서도 돈다(수집만 Windows 전용).
 """
 from __future__ import annotations
@@ -19,6 +24,7 @@ from pathlib import Path
 import aggregate
 import collect
 import config
+import period as P
 import report
 
 try:
@@ -44,19 +50,22 @@ def make_logger(log_path: Path | None, echo=True):
     return log, fh
 
 
-def run(ymd: str | None = None, cfg: dict | None = None, do_collect: bool = True,
+def run(per=None, cfg: dict | None = None, do_collect: bool = True,
         log=print, should_stop=None, pump=None) -> dict:
     """반환: {'ok':bool, 'report':Path|None, 'agg':dict|None, 'result':dict|None, 'summary':str}"""
     cfg = cfg or config.load()
-    ymd = ymd or collect.target_date(cfg.get("offset_days", 1))
-    pretty = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+    if per is None:
+        per = P.previous_day(cfg.get("offset_days", 1))
+    elif isinstance(per, str):
+        per = P.parse(per)
+    pretty = per.title
 
     result = None
     if do_collect:
-        result = collect.run_collect(ymd, cfg, log=log, should_stop=should_stop, pump=pump)
+        result = collect.run_collect(per, cfg, log=log, should_stop=should_stop, pump=pump)
         run_dir = result["run_dir"]
     else:
-        run_dir = collect.run_dir_for(cfg["export_dir"], ymd)
+        run_dir = collect.run_dir_for(cfg["export_dir"], per)
         log(f"■ 수집 생략 — 기존 폴더로 집계합니다: {run_dir}")
     if not run_dir.exists():
         raise RuntimeError(f"수집 폴더가 없습니다: {run_dir}\n"
@@ -66,7 +75,9 @@ def run(ymd: str | None = None, cfg: dict | None = None, do_collect: bool = True
     log("\n■ 집계 · 보고서 생성")
     agg = aggregate.aggregate_folder(run_dir, cfg["teams"])
     got = {t["team"] for t in agg["teams"]}
+    kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
     meta = {
+        "kind": kind,
         "failed": (result or {}).get("failed", []),
         # 파일이 아예 없는 작업반 — 0건이라 지운 것과 구분해 점검 시트에 남긴다
         "missing": [t["code"] for t in config.active_teams(cfg)
@@ -74,7 +85,7 @@ def run(ymd: str | None = None, cfg: dict | None = None, do_collect: bool = True
                     and t["code"] not in (result or {}).get("empty", [])
                     and t["code"] not in (result or {}).get("failed", [])],
     }
-    out = run_dir / f"일마감_공정진척_{ymd}.xlsx"
+    out = run_dir / f"{kind}_공정진척_{per.label}.xlsx"
     if out.exists():
         # 지난 실행에서 열어 본 보고서가 Excel 에 물려 있으면 같은 이름으로 저장이 안 된다.
         try:
@@ -84,24 +95,43 @@ def run(ymd: str | None = None, cfg: dict | None = None, do_collect: bool = True
             pass
     out = report.build(agg, pretty, out, meta)
 
-    summary = aggregate.summary_text(agg, pretty)
+    summary = aggregate.summary_text(agg, pretty, kind)
     log("")
     log(summary)
     log(f"\n보고서: {out}")
     return {"ok": True, "report": out, "agg": agg, "result": result,
-            "summary": summary, "run_dir": run_dir, "ymd": ymd}
+            "summary": summary, "run_dir": run_dir, "period": per, "ymd": per.label}
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     auto = "--auto" in argv
     do_collect = "--no-collect" not in argv
-    ymd = None
-    if "--date" in argv:
-        ymd = re.sub(r"\D", "", argv[argv.index("--date") + 1])
-        if len(ymd) != 8:
-            print("--date 는 YYYY-MM-DD 또는 YYYYMMDD 형식이어야 합니다")
-            return 2
+
+    def opt(name):
+        return argv[argv.index(name) + 1] if name in argv else None
+
+    per = None
+    try:
+        if "--last-month" in argv:
+            per = P.previous_month()
+        elif "--this-month" in argv:
+            per = P.this_month()
+        elif opt("--month"):
+            per = P.month(opt("--month"))
+        elif opt("--from") or opt("--to"):
+            a, b = opt("--from"), opt("--to")
+            if not (a and b):
+                print("--from 과 --to 는 함께 지정해야 합니다")
+                return 2
+            per = P.custom(a, b)
+        elif opt("--date"):
+            per = P.day(opt("--date"))
+        elif opt("--period"):
+            per = P.parse(opt("--period"))
+    except (ValueError, IndexError) as e:
+        print(f"기간 지정 오류: {e}")
+        return 2
 
     cfg = config.load()
     if "--teams" in argv:            # 시험용 — 일부 작업반만 (예: --teams M2105,M1101)
@@ -109,13 +139,15 @@ def main(argv=None):
         for t in cfg["teams"]:
             t["use"] = t["code"].upper() in want
         print(f"[일부 실행] 작업반 {sorted(want)} 만 처리합니다")
-    ymd = ymd or collect.target_date(cfg.get("offset_days", 1))
+    if per is None:
+        per = P.previous_day(cfg.get("offset_days", 1))
     log_path = (config.to_local_path(cfg["export_dir"]) / "logs"
                 / f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.log")
     log, fh = make_logger(log_path, echo=True)
-    log(f"=== 일마감 공정진척 자동 실행 시작 ({'스케줄' if auto else '수동'}) ===")
+    kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
+    log(f"=== {kind} 공정진척 자동 실행 시작 ({'스케줄' if auto else '수동'}) — {per.title} ===")
     try:
-        r = run(ymd, cfg, do_collect=do_collect, log=log)
+        r = run(per, cfg, do_collect=do_collect, log=log)
         fails = (r["result"] or {}).get("failed", [])
         log(f"=== 완료 === 로그: {log_path}")
         if not auto and cfg.get("open_report"):

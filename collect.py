@@ -16,6 +16,7 @@ from pathlib import Path
 
 import config
 import ierp_progress as ip
+import period as P
 
 
 class Cancelled(RuntimeError):
@@ -37,14 +38,19 @@ def _hms(sec: float) -> str:
 
 
 def target_date(offset_days: int = 1, today: datetime.date | None = None) -> str:
-    """대상일자 'YYYYMMDD'. offset_days=1 이면 전날."""
+    """대상일자 'YYYYMMDD'. offset_days=1 이면 전날. (기존 호출부 호환용)"""
     d = (today or datetime.date.today()) - datetime.timedelta(days=int(offset_days))
     return d.strftime("%Y%m%d")
 
 
-def run_dir_for(export_dir, ymd: str) -> Path:
-    """대상일자별 폴더. 같은 날을 다시 돌리면 같은 폴더 → 이어받기가 된다."""
-    return config.to_local_path(str(export_dir)) / f"day_{ymd}"
+def run_dir_for(export_dir, per) -> Path:
+    """기간별 폴더. 같은 기간을 다시 돌리면 같은 폴더 → 이어받기가 된다.
+
+    ⚠️ 폴더 이름이 이어받기 키다. day_/month_/range_ 접두어로 갈라 두어야
+      '8월 하루치' 와 '8월 한 달치' 가 같은 폴더에 섞이지 않는다."""
+    if isinstance(per, str):                    # 'YYYYMMDD' 를 주면 하루로 본다(호환)
+        per = P.day(per)
+    return config.to_local_path(str(export_dir)) / per.dirname
 
 
 def _log_row(run_dir: Path, team, status, detail=""):
@@ -103,7 +109,7 @@ def verify_saved(xlsx_path: Path, team: str) -> tuple[bool, str, int]:
     return True, f"데이터 {len(rows):,}행", len(rows)
 
 
-def collect_one(top, scfg, dtps, code_h, name_h, team: str, ymd: str,
+def collect_one(top, scfg, dtps, code_h, name_h, team: str, per,
                 out_path: Path, log=print, should_stop=None) -> tuple[bool | None, int, str]:
     """작업반 1개 수집. 반환: (True 저장 / None 0건 / False 실패, 행수, 작업반명)"""
     import excel_grab
@@ -121,16 +127,22 @@ def collect_one(top, scfg, dtps, code_h, name_h, team: str, ymd: str,
             f" (없는 코드이거나 입력칸을 잘못 잡았을 수 있습니다)")
         return False, 0, team_nm
 
-    # 2) 대상일자
-    if not ip.set_period(dtps, ymd, log=log):
-        log(f"      ※ 대상일자 {ymd} 입력 실패")
+    # 2) 개시예정일 기간
+    if not ip.set_period(dtps, per.d_from, per.d_to, log=log):
+        log(f"      ※ 기간 {per.d_from}~{per.d_to} 입력 실패")
         return False, 0, team_nm
 
-    # ⚠️ 조회 직전에 한 번 더 대조 — 엉뚱한 날짜를 그 날짜 파일로 저장하는 게 최악의 사고다.
-    shown = ip.read_date(dtps[0])
-    if shown and shown != ymd:
-        log(f"      ※ 일자 불일치(화면 {shown} ≠ 요청 {ymd}) — 건너뜁니다")
+    # ⚠️ 조회 직전에 한 번 더 대조 — 엉뚱한 기간을 그 기간 파일로 저장하는 게 최악의 사고다.
+    #   월마감은 한 번에 한 달치가 들어오므로 틀리면 피해가 더 크다.
+    shown_from = ip.read_date(dtps[0])
+    if shown_from and shown_from != per.d_from:
+        log(f"      ※ 시작일 불일치(화면 {shown_from} ≠ 요청 {per.d_from}) — 건너뜁니다")
         return False, 0, team_nm
+    if len(dtps) >= 2:
+        shown_to = ip.read_date(dtps[1])
+        if shown_to and shown_to != per.d_to:
+            log(f"      ※ 종료일 불일치(화면 {shown_to} ≠ 요청 {per.d_to}) — 건너뜁니다")
+            return False, 0, team_nm
 
     # 3) 조회 → 앱이 다시 응답할 때까지 대기 (= 조회 종료)
     t1 = time.monotonic()
@@ -173,22 +185,27 @@ def collect_one(top, scfg, dtps, code_h, name_h, team: str, ymd: str,
     return True, rows, team_nm
 
 
-def run_collect(ymd: str | None = None, cfg: dict | None = None, log=print,
+def run_collect(per=None, cfg: dict | None = None, log=print,
                 should_stop=None, pump=None) -> dict:
-    """대상일자 하루를 작업반별로 수집한다.
+    """기간 하나를 작업반별로 수집한다. per = period.Period (없으면 설정대로 전날).
 
-    반환: {'run_dir':Path, 'ymd':str, 'saved':[...], 'empty':[...], 'failed':[...], 'names':{}}
+    반환: {'run_dir':Path, 'period':Period, 'saved':[...], 'empty':[...],
+           'failed':[...], 'names':{}}
     """
     import excel_grab
 
     cfg = cfg or config.load()
-    ymd = ymd or target_date(cfg.get("offset_days", 1))
+    if per is None:
+        per = P.previous_day(cfg.get("offset_days", 1))
+    elif isinstance(per, str):
+        per = P.parse(per)
     teams = config.active_teams(cfg)
-    run_dir = run_dir_for(cfg["export_dir"], ymd)
+    run_dir = run_dir_for(cfg["export_dir"], per)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     scfg = ip.load_screen()
-    log(f"■ 대상일자 {ymd[:4]}-{ymd[4:6]}-{ymd[6:]} / 작업반 {len(teams)}개 → {run_dir}")
+    kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
+    log(f"■ {kind} {per.title} / 작업반 {len(teams)}개 → {run_dir}")
 
     excel_grab.guard_excel(log=log)
     top = ip.ensure_screen(scfg, log=log)
@@ -197,8 +214,14 @@ def run_collect(ymd: str | None = None, cfg: dict | None = None, log=print,
 
     dtps = ip.find_children_by_class(top, scfg["dtp_class"])
     if not dtps:
-        raise RuntimeError("조회일자(DateTimePicker)를 찾지 못했습니다 — "
+        raise RuntimeError("개시예정일(DateTimePicker)을 찾지 못했습니다 — "
                            "py probe_progress.py 로 화면 구성을 확인하세요.")
+    if len(dtps) < 2 and not per.is_single_day:
+        # ★ 기간을 넣을 칸이 없는데 월마감을 돌리면, 하루치를 한 달치로 착각해 저장한다.
+        #   조용히 틀린 숫자를 쌓는 것보다 시작하지 않는 게 낫다.
+        raise RuntimeError(
+            f"이 화면의 날짜 칸이 1개뿐이라 기간({per.title}) 조회를 할 수 없습니다.\n"
+            f"  일 단위로만 돌리거나, probe_progress.py 로 화면 구성을 확인하세요.")
     code_h, name_h, _edits = ip.resolve_team_fields(top, scfg, log=log)
     if code_h is None:
         raise RuntimeError(
@@ -229,7 +252,7 @@ def run_collect(ymd: str | None = None, cfg: dict | None = None, log=print,
         if pump:
             pump()
         code = t["code"]
-        out = run_dir / f"progress_{code}_{ymd}.xlsx"
+        out = run_dir / f"progress_{code}_{per.label}.xlsx"
         if out.exists():
             log(f"   ({i}/{len(teams)}) {code} · 이미 있음 — 건너뜀")
             saved.append(code)
@@ -248,7 +271,7 @@ def run_collect(ymd: str | None = None, cfg: dict | None = None, log=print,
                 code_h, name_h, _ = ip.resolve_team_fields(top, scfg, log=log)
                 ip.set_checkboxes(top, scfg, log=log)   # 화면을 새로 열면 기본값으로 돌아온다
 
-            res, rows, nm = collect_one(top, scfg, dtps, code_h, name_h, code, ymd,
+            res, rows, nm = collect_one(top, scfg, dtps, code_h, name_h, code, per,
                                         out, log=log, should_stop=should_stop)
             if nm:
                 names[code] = nm
@@ -302,5 +325,5 @@ def run_collect(ymd: str | None = None, cfg: dict | None = None, log=print,
     if failed:
         log(f"※ 실패한 작업반: {', '.join(failed)} — 같은 날짜로 다시 실행하면 이어받습니다")
 
-    return {"run_dir": run_dir, "ymd": ymd, "saved": saved, "empty": empty,
-            "failed": failed, "names": names}
+    return {"run_dir": run_dir, "period": per, "ymd": per.label, "saved": saved,
+            "empty": empty, "failed": failed, "names": names}

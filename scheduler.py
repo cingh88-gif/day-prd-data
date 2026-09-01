@@ -26,7 +26,9 @@ IS_WINDOWS = sys.platform.startswith("win")
 # Windows 쪽 배포 폴더 — 배포.sh 가 여기로 복사한다(형제 프로젝트와 같은 규약)
 WIN_DIR = r"C:\ierp_day_prd"
 BAT_NAME = "일일수집_자동.bat"
+MONTH_BAT_NAME = "월마감수집_자동.bat"
 DEFAULT_TASK = "iERP_일마감_공정진척"
+DEFAULT_MONTH_TASK = "iERP_월마감_공정진척"
 
 SCHTASKS = ("schtasks.exe" if IS_WINDOWS else "/mnt/c/Windows/System32/schtasks.exe")
 
@@ -62,13 +64,13 @@ def describe_time(hhmm: str) -> str:
     return f"{ampm} {h12}:{m:02d} ({hhmm})"
 
 
-def target_command(win_dir: str = WIN_DIR) -> str:
-    return f'"{win_dir}\\{BAT_NAME}"'
+def target_command(win_dir: str = WIN_DIR, monthly: bool = False) -> str:
+    return f'"{win_dir}\\{MONTH_BAT_NAME if monthly else BAT_NAME}"'
 
 
 def create(hhmm: str, task_name: str = DEFAULT_TASK, win_dir: str = WIN_DIR
            ) -> tuple[bool, str]:
-    """매일 hhmm 에 도는 작업을 등록(있으면 덮어씀). 반환 (성공, 메시지)."""
+    """매일 hhmm 에 도는 작업(일마감)을 등록(있으면 덮어씀). 반환 (성공, 메시지)."""
     if not valid_time(hhmm):
         return False, f"시간 형식이 잘못됐습니다: {hhmm!r} — 24시간제 HH:MM (예: 11:00, 23:30)"
     if not available():
@@ -84,6 +86,35 @@ def create(hhmm: str, task_name: str = DEFAULT_TASK, win_dir: str = WIN_DIR
     if rc == 0:
         return True, (f"등록됨 — 매일 {describe_time(hhmm)} 에 실행합니다.\n"
                       f"작업 이름: {task_name}\n실행 대상: {target_command(win_dir)}")
+    return False, f"등록 실패(코드 {rc})\n{out}"
+
+
+def create_monthly(hhmm: str, day_of_month: int = 1,
+                   task_name: str = DEFAULT_MONTH_TASK,
+                   win_dir: str = WIN_DIR) -> tuple[bool, str]:
+    """매월 <day_of_month> 일 hhmm 에 **전월 전체**를 받는 작업(월마감)을 등록한다.
+
+    ★ 왜 전월인가: 월마감은 달이 끝난 뒤에 확정된다. 1일에 돌려 전월을 받는 게 기본이고,
+      마감이 늦으면 day_of_month 를 2~5 일로 미루면 된다.
+    ⚠️ 일마감과 **다른 작업 이름**을 쓴다. 같은 이름으로 덮어쓰면 일마감이 사라진다."""
+    if not valid_time(hhmm):
+        return False, f"시간 형식이 잘못됐습니다: {hhmm!r} — 24시간제 HH:MM"
+    if not 1 <= int(day_of_month) <= 28:
+        # 29~31 은 없는 달이 있어 그 달을 통째로 건너뛴다 → 28 까지만 받는다.
+        return False, f"실행일은 1~28 이어야 합니다(29~31 은 없는 달이 있습니다): {day_of_month}"
+    if not available():
+        return False, "schtasks.exe 를 쓸 수 없습니다 — Windows 에서 실행하세요"
+    rc, out = _run([
+        "/Create", "/SC", "MONTHLY", "/D", str(int(day_of_month)), "/ST", hhmm,
+        "/TN", task_name,
+        "/TR", target_command(win_dir, monthly=True),
+        "/IT", "/RL", "LIMITED", "/F",
+    ])
+    if rc == 0:
+        return True, (f"등록됨 — 매월 {int(day_of_month)}일 {describe_time(hhmm)} 에 "
+                      f"**전월 전체**를 받습니다.\n"
+                      f"작업 이름: {task_name}\n"
+                      f"실행 대상: {target_command(win_dir, monthly=True)}")
     return False, f"등록 실패(코드 {rc})\n{out}"
 
 
@@ -128,6 +159,10 @@ if __name__ == "__main__":
         print(create(t, name)[1])
     elif cmd == "delete":
         print(delete(name)[1])
+    elif cmd == "monthly":
+        t = sys.argv[2] if len(sys.argv) > 2 else cfg["schedule"].get("month_time", "11:00")
+        d = int(sys.argv[3]) if len(sys.argv) > 3 else cfg["schedule"].get("month_day", 1)
+        print(create_monthly(t, d)[1])
     elif cmd == "run":
         print(run_now(name)[1])
     else:

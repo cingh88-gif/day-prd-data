@@ -86,6 +86,12 @@ DEFAULTS = {
         # 24시간제 HH:MM. 사용자가 11시/12시를 아직 못 정해서 GUI 에서 바꾸게 해 둔다.
         "time": "11:00",
         "task_name": "iERP_일마감_공정진척",
+        # 월마감 — 매월 <month_day>일 <month_time> 에 **전월 전체**를 받는다.
+        #   일마감과 작업 이름이 달라야 서로 덮어쓰지 않는다.
+        "month_enabled": False,
+        "month_time": "11:00",
+        "month_day": 1,
+        "month_task_name": "iERP_월마감_공정진척",
     },
     # 수집 후 보고서를 자동으로 열지 여부(수동 실행일 때만)
     "open_report": True,

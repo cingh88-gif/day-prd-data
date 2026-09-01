@@ -19,6 +19,7 @@ import sys
 import traceback
 
 import config
+import period as P
 import scheduler
 
 IS_WINDOWS = sys.platform.startswith("win")
@@ -129,29 +130,82 @@ def main():
     f_run = ttk.LabelFrame(right, text="실행 조건", padding=6)
     f_run.pack(fill="x")
 
-    ttk.Label(f_run, text="대상일자").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-    v_date = tk.StringVar()
-    e_date = ttk.Entry(f_run, textvariable=v_date, width=12)
-    e_date.grid(row=0, column=1, sticky="w", pady=4)
-    v_yesterday = tk.BooleanVar(value=True)
+    # ── 기간 모드: 일마감 / 월마감 / 직접지정 ──
+    v_mode = tk.StringVar(value="day")
+    v_a = tk.StringVar()      # 일마감=대상일자, 월마감=연월, 직접=시작일
+    v_b = tk.StringVar()      # 직접지정 종료일
+    v_auto = tk.BooleanVar(value=True)   # 실행 시점 기준 자동(전날/전월)
 
-    def refresh_date(*_):
-        if v_yesterday.get():
-            import collect as C
-            v_date.set(C.target_date(cfg.get("offset_days", 1)))
-            e_date.configure(state="disabled")
+    row = ttk.Frame(f_run)
+    row.grid(row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(2, 4))
+    for val, txt in (("day", "일마감 (하루)"), ("month", "월마감 (한 달)"),
+                     ("range", "직접 지정")):
+        ttk.Radiobutton(row, text=txt, value=val, variable=v_mode,
+                        command=lambda: refresh_period()).pack(side="left", padx=(0, 14))
+
+    lbl_a = ttk.Label(f_run, text="대상일자")
+    lbl_a.grid(row=1, column=0, sticky="e", padx=4, pady=4)
+    e_a = ttk.Entry(f_run, textvariable=v_a, width=13)
+    e_a.grid(row=1, column=1, sticky="w", pady=4)
+    lbl_b = ttk.Label(f_run, text="~ 종료일")
+    e_b = ttk.Entry(f_run, textvariable=v_b, width=13)
+    chk_auto = ttk.Checkbutton(f_run, text="실행 시점 기준 자동", variable=v_auto,
+                               command=lambda: refresh_period())
+    v_period_desc = tk.StringVar()
+    ttk.Label(f_run, textvariable=v_period_desc, font=("맑은 고딕", 9),
+              foreground="#356").grid(row=2, column=0, columnspan=4, sticky="w",
+                                      padx=6, pady=(0, 4))
+
+    def current_period():
+        """지금 화면 설정으로 기간 객체를 만든다. 잘못된 입력이면 ValueError."""
+        m = v_mode.get()
+        if v_auto.get() and m == "day":
+            return P.previous_day(cfg.get("offset_days", 1))
+        if v_auto.get() and m == "month":
+            return P.previous_month()
+        if m == "day":
+            return P.day(v_a.get())
+        if m == "month":
+            return P.month(v_a.get())
+        return P.custom(v_a.get(), v_b.get())
+
+    def refresh_period(*_):
+        m = v_mode.get()
+        lbl_b.grid_forget(); e_b.grid_forget(); chk_auto.grid_forget()
+        if m == "range":
+            lbl_a.configure(text="시작일")
+            lbl_b.grid(row=1, column=2, sticky="e", padx=4)
+            e_b.grid(row=1, column=3, sticky="w", padx=4)
+            if not v_a.get():
+                v_a.set(P.previous_month().d_from)
+            if not v_b.get():
+                v_b.set(P.previous_month().d_to)
         else:
-            e_date.configure(state="normal")
+            lbl_a.configure(text="대상일자" if m == "day" else "대상 연월")
+            chk_auto.grid(row=1, column=2, sticky="w", padx=8)
+        if v_auto.get() and m != "range":
+            auto = P.previous_day(cfg.get("offset_days", 1)) if m == "day" \
+                else P.previous_month()
+            v_a.set(auto.label if m == "month" else auto.d_from)
+            e_a.configure(state="disabled")
+        else:
+            e_a.configure(state="normal")
+        try:
+            per = current_period()
+            kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
+            v_period_desc.set(f"→ {kind} · 개시예정일 {per.title}   |   폴더 {per.dirname}")
+        except ValueError as e:
+            v_period_desc.set(f"→ {e}".splitlines()[0])
 
-    ttk.Checkbutton(f_run, text="전날 자동(실행 시점 기준)", variable=v_yesterday,
-                    command=refresh_date).grid(row=0, column=2, sticky="w", padx=6)
-    refresh_date()
+    for var in (v_a, v_b):
+        var.trace_add("write", refresh_period)
+    refresh_period()
 
-    ttk.Label(f_run, text="저장 폴더").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+    ttk.Label(f_run, text="저장 폴더").grid(row=3, column=0, sticky="e", padx=4, pady=4)
     v_out = tk.StringVar(value=cfg["export_dir"])
     ttk.Entry(f_run, textvariable=v_out, width=42).grid(
-        row=1, column=1, columnspan=2, sticky="we", pady=4)
-    f_run.columnconfigure(2, weight=1)
+        row=3, column=1, columnspan=3, sticky="we", pady=4)
+    f_run.columnconfigure(3, weight=1)
 
     # ══════════════ 매일 자동 실행 ══════════════
     f_sch = ttk.LabelFrame(right, text="매일 자동 실행 (Windows 작업 스케줄러)", padding=6)
@@ -177,7 +231,12 @@ def main():
 
     def refresh_sched():
         ok, msg = scheduler.query(cfg["schedule"].get("task_name", scheduler.DEFAULT_TASK))
-        v_sch_state.set(("● " if ok else "○ ") + msg)
+        v_sch_state.set(("● 일마감 " if ok else "○ 일마감 ") + msg)
+        try:
+            ok2, msg2 = scheduler.query(mtask())
+            v_msch_state.set(("● 월마감 " if ok2 else "○ 월마감 ") + msg2)
+        except NameError:
+            pass
 
     def do_register():
         t = v_time.get().strip()
@@ -196,17 +255,70 @@ def main():
         refresh_sched()
         (messagebox.showinfo if ok else messagebox.showerror)("자동 실행", msg)
 
-    ttk.Button(f_sch, text="등록 / 변경", command=do_register, width=12).grid(
+    ttk.Button(f_sch, text="일마감 등록", command=do_register, width=12).grid(
         row=2, column=0, padx=4, pady=2)
     ttk.Button(f_sch, text="해제", command=do_unregister, width=8).grid(
         row=2, column=1, padx=2, pady=2, sticky="w")
     ttk.Button(f_sch, text="상태 새로고침", command=lambda: refresh_sched(), width=13).grid(
         row=2, column=2, padx=2, pady=2, sticky="w")
+
+    ttk.Separator(f_sch, orient="horizontal").grid(
+        row=3, column=0, columnspan=4, sticky="we", pady=6)
+
+    # ── 월마감: 매월 N일에 전월 전체 ──
+    ttk.Label(f_sch, text="월마감 — 매월").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+    mrow = ttk.Frame(f_sch); mrow.grid(row=4, column=1, columnspan=2, sticky="w")
+    v_mday = tk.StringVar(value=str(cfg["schedule"].get("month_day", 1)))
+    ttk.Spinbox(mrow, from_=1, to=28, textvariable=v_mday, width=4).pack(side="left")
+    ttk.Label(mrow, text="일").pack(side="left", padx=(2, 10))
+    v_mtime = tk.StringVar(value=cfg["schedule"].get("month_time", "11:00"))
+    ttk.Entry(mrow, textvariable=v_mtime, width=8).pack(side="left")
+    v_mdesc = tk.StringVar()
+    ttk.Label(mrow, textvariable=v_mdesc, font=("맑은 고딕", 9)).pack(side="left", padx=8)
+
+    def on_mtime_change(*_):
+        t = v_mtime.get().strip()
+        v_mdesc.set(f"→ {scheduler.describe_time(t)} 에 전월 전체"
+                    if scheduler.valid_time(t) else "→ HH:MM")
+    v_mtime.trace_add("write", on_mtime_change); on_mtime_change()
+
+    v_msch_state = tk.StringVar(value="확인 중…")
+    ttk.Label(f_sch, textvariable=v_msch_state, font=("맑은 고딕", 9)).grid(
+        row=5, column=0, columnspan=4, sticky="w", padx=4, pady=(2, 4))
+
+    def mtask():
+        return cfg["schedule"].get("month_task_name", scheduler.DEFAULT_MONTH_TASK)
+
+    def do_register_month():
+        t = v_mtime.get().strip()
+        try:
+            d = int(v_mday.get())
+        except ValueError:
+            messagebox.showwarning("실행일", "실행일은 1~28 사이의 숫자여야 합니다."); return
+        save_cfg()
+        ok, msg = scheduler.create_monthly(t, d, mtask())
+        refresh_sched()
+        (messagebox.showinfo if ok else messagebox.showerror)("월마감 자동 실행", msg)
+        if ok:
+            log(f"[스케줄] {msg}")
+
+    def do_unregister_month():
+        ok, msg = scheduler.delete(mtask())
+        refresh_sched()
+        (messagebox.showinfo if ok else messagebox.showerror)("월마감 자동 실행", msg)
+
+    ttk.Button(f_sch, text="월마감 등록", command=do_register_month, width=12).grid(
+        row=6, column=0, padx=4, pady=2)
+    ttk.Button(f_sch, text="해제", command=do_unregister_month, width=8).grid(
+        row=6, column=1, padx=2, pady=2, sticky="w")
+
     ttk.Label(f_sch,
               text="※ 자동 실행은 PC 가 켜져 있고 로그온된 상태에서만 됩니다 "
-                   "(iERP 창을 조작해야 하므로).",
-              font=("맑은 고딕", 9), foreground="#666").grid(
-        row=3, column=0, columnspan=4, sticky="w", padx=4, pady=(2, 0))
+                   "(iERP 창을 조작해야 하므로).\n"
+                   "※ 월마감은 매월 지정일에 전월 한 달치를 받습니다. "
+                   "29~31일은 없는 달이 있어 1~28일만 됩니다.",
+              font=("맑은 고딕", 9), foreground="#666", justify="left").grid(
+        row=7, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
 
     # ══════════════ 로그 ══════════════
     f_log = ttk.LabelFrame(right, text="진행", padding=4)
@@ -250,6 +362,11 @@ def main():
         collect_team_state()
         cfg["export_dir"] = v_out.get().strip() or config.default_export_dir()
         cfg["schedule"]["time"] = v_time.get().strip()
+        cfg["schedule"]["month_time"] = v_mtime.get().strip()
+        try:
+            cfg["schedule"]["month_day"] = int(v_mday.get())
+        except ValueError:
+            pass
         cfg["offset_days"] = 1
         config.save(cfg)
 
@@ -270,20 +387,30 @@ def main():
         btn_run.configure(state="disabled")
         btn_again.configure(state="disabled")
         btn_stop.configure(state="normal" if do_collect else "disabled")
-        ymd = v_date.get().strip().replace("-", "")
+        try:
+            per = current_period()
+        except ValueError as e:
+            messagebox.showwarning("기간", str(e))
+            btn_run.configure(state="normal"); btn_again.configure(state="normal")
+            btn_stop.configure(state="disabled")
+            return
+        kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
         log("=" * 60)
-        log(f"[{datetime.datetime.now():%H:%M:%S}] 시작 — 대상일자 {ymd}"
+        log(f"[{datetime.datetime.now():%H:%M:%S}] 시작 — {kind} {per.title}"
             f"{' (수집 포함)' if do_collect else ' (집계·보고서만)'}")
+        if do_collect and per.mode != "day":
+            log(f"  ※ 기간이 { (int(per.d_to) - int(per.d_from)) and '하루가 아닙니다' or ''}"
+                f" 한 번에 받으므로 조회가 오래 걸릴 수 있습니다.")
         try:
             # ※ pywinauto(uia)는 메인 스레드에서 돌아야 한다 → 별도 스레드를 쓰지 않고
             #    root.update 를 pump 로 넘겨 화면이 멈춘 것처럼 보이지 않게 한다.
-            r = run_daily.run(ymd, cfg, do_collect=do_collect, log=log,
+            r = run_daily.run(per, cfg, do_collect=do_collect, log=log,
                               should_stop=lambda: stop_flag["stop"], pump=root.update)
             fails = (r["result"] or {}).get("failed", [])
             msg = f"보고서:\n{r['report']}"
             if fails:
                 msg += f"\n\n※ 수집 실패 작업반: {', '.join(fails)}\n" \
-                       "같은 날짜로 다시 실행하면 이어받습니다."
+                       "같은 기간으로 다시 실행하면 이어받습니다."
             if cfg.get("open_report"):
                 _open(r["report"])
             (messagebox.showwarning if fails else messagebox.showinfo)("완료", msg)

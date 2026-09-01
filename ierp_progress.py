@@ -259,17 +259,90 @@ def click_button(top_hwnd, name: str, cfg: dict):
 # ====================================================================
 # 화면 열기 / 재접속
 # ====================================================================
+def force_foreground(hwnd, tries: int = 5, log=print) -> bool:
+    """창을 확실히 앞으로 가져오고 **정말 앞에 왔는지 확인**한다.
+
+    ★★ 2026-09-01~02 실측 — 두 번 당했다.
+      `SetForegroundWindow` 는 호출 프로세스가 포그라운드가 아니면 Windows 가 **조용히
+      거부**한다(반환값만 실패, 예외 없음). 그걸 무시하고 `send_keys` 를 하면 키가
+      **그때 포커스를 가진 아무 창에나 들어간다.** 무인 스케줄 실행에서 이러면
+      'PM60250Rv3' 과 Enter 가 사용자의 메모장이나 브라우저에 찍힌다.
+    → ① 최소화돼 있으면 복원 ② 포그라운드 스레드에 입력 큐를 붙여(AttachThreadInput)
+      권한을 빌린 뒤 SetForegroundWindow ③ **확인**하고 아니면 재시도.
+      끝까지 실패하면 **키를 보내지 않고** False 를 돌려준다."""
+    try:
+        import win32gui
+        import win32con
+        import ctypes
+    except ImportError:
+        return False
+    user32 = ctypes.windll.user32
+    for i in range(tries):
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.3)
+            fg = user32.GetForegroundWindow()
+            if fg == hwnd:
+                return True
+            # ⚠️ GetCurrentThreadId 는 win32process 가 아니라 kernel32 에 있다.
+            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            attached = False
+            if fg_tid and fg_tid != cur_tid:
+                attached = bool(user32.AttachThreadInput(fg_tid, cur_tid, True))
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            finally:
+                if attached:
+                    user32.AttachThreadInput(fg_tid, cur_tid, False)
+            time.sleep(0.4)
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+
+            # ④ 그래도 안 되면 한 단계 더 — 2026-09-02 실측으로 통한 조합.
+            #   막고 있던 것은 사용자가 열어 둔 **다른 iERP 화면**이었다.
+            #   · ALT 를 눌렀다 떼서 '마지막 입력을 받은 프로세스' 조건을 만족시키고
+            #   · TOPMOST 로 올렸다가 바로 되돌려 Z-순서를 끌어올린다
+            #     (TOPMOST 로 두면 사용자 창을 계속 덮으므로 반드시 되돌린다)
+            user32.keybd_event(0x12, 0, 0, 0)          # VK_MENU down
+            time.sleep(0.05)
+            user32.keybd_event(0x12, 0, 2, 0)          # KEYEVENTF_KEYUP
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.4)
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+        except Exception as e:
+            log(f"      · 창 활성화 시도 {i + 1} 실패({e})")
+        time.sleep(0.5)
+    return False
+
+
 def open_via_search(program_id: str, log=print):
     """iEMenu 에서 F9(메뉴검색) → 프로그램ID → Enter.
-    같은 화면이 이미 떠 있으면 iERP 가 **기존 창을 재사용**한다(중복으로 안 열림)."""
+    같은 화면이 이미 떠 있으면 iERP 가 **기존 창을 재사용**한다(중복으로 안 열림).
+
+    ⚠️ iEMenu 를 확실히 앞으로 못 가져오면 **키를 아예 보내지 않는다.**
+      엉뚱한 창에 프로그램ID 를 타이핑하는 것보다 실패하는 게 낫다."""
     import win32gui
     menu = find_hwnd(r"^iEMenu$") or find_hwnd(r".*iEMenu.*")
     if not menu:
         raise RuntimeError("iEMenu 창을 찾지 못했습니다 — iERP 에 로그인돼 있는지 확인하세요.")
-    try:
-        win32gui.SetForegroundWindow(menu)
-    except Exception:
-        pass
+    if not force_foreground(menu, log=log):
+        raise RuntimeError(
+            "iEMenu 를 앞으로 가져오지 못했습니다 — 키 입력을 보내지 않고 멈춥니다.\n"
+            "  (다른 창이 포커스를 붙잡고 있습니다. 전체화면 앱이나 대화상자를 닫고 "
+            "다시 실행하세요.)")
     time.sleep(0.5)
     send_keys("{F9}")
     time.sleep(0.9)
@@ -316,12 +389,9 @@ def ensure_screen(cfg: dict, log=print, busy_wait: float = QUERY_TIMEOUT):
         f"probe_progress.py --titles 로 창 제목을 확인하세요.")
 
 
-def focus_window(hwnd):
-    try:
-        import win32gui
-        win32gui.SetForegroundWindow(hwnd)
-    except Exception:
-        pass
+def focus_window(hwnd, log=print) -> bool:
+    """화면을 앞으로. 실패해도 진행은 하지만(클릭이 포커스를 가져오므로) 결과를 돌려준다."""
+    return force_foreground(hwnd, tries=3, log=log)
 
 
 # ====================================================================
@@ -533,14 +603,23 @@ def set_date(dtp_hwnd, ymd: str, tries: int = 3, log=print) -> bool:
     return False
 
 
-def set_period(dtps: list[int], ymd: str, log=print) -> bool:
-    """대상일자 하루를 시작/종료 DTP 에 같은 날짜로 넣는다(칸이 1개면 그것만)."""
+def set_period(dtps: list[int], d_from: str, d_to: str | None = None,
+               log=print) -> bool:
+    """개시예정일 기간을 시작/종료 DTP 에 넣는다.
+
+    하루치면 d_from == d_to 로 같은 날짜가 들어간다(일마감).
+    월마감이면 그 달 1일~말일이 들어간다.
+    ⚠️ 날짜 칸이 1개뿐인 화면이면 시작일만 넣는다 — 그 경우 기간 조회가 안 되므로
+      월 단위로 받을 수 없다(호출자가 판단하도록 False 가 아니라 True 를 돌려주되 로그를 남긴다)."""
     if not dtps:
         return False
-    if not set_date(dtps[0], ymd, log=log):
+    d_to = d_to or d_from
+    if not set_date(dtps[0], d_from, log=log):
         return False
     if len(dtps) >= 2:
-        return set_date(dtps[1], ymd, log=log)
+        return set_date(dtps[1], d_to, log=log)
+    if d_from != d_to:
+        log("      ※ 날짜 칸이 1개뿐이라 기간 조회를 할 수 없습니다 — 시작일만 넣었습니다")
     return True
 
 
