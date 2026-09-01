@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+ierp_inspect/
+screen.json
+config.json
+*.log

@@ -1,0 +1,13 @@
+# iERP 공정진척현황(PM60250Rv3) 일마감 수집 의존성
+#   py -m pip install -r requirements.txt
+#
+# ⚠️ 수집(collect/ierp_progress/excel_grab)만 Windows 전용이다.
+#    집계(aggregate)·보고서(report)는 openpyxl 만 있으면 WSL 에서도 돈다.
+
+pywinauto        # UIA 자동화 (iERP = .NET WinForms → backend="uia")
+pywin32          # Excel COM (win32com.client, pythoncom, win32gui, win32process)
+comtypes         # ★ 보이는 Excel 창에 COM 을 직접 바인딩(AccessibleObjectFromWindow)하는 데 필수.
+                 #   pywinauto 의 전이 의존성이라 대개 같이 깔리지만, 형제 프로젝트들이
+                 #   반복해서 빠뜨렸던 항목이라 명시한다.
+openpyxl         # 엑셀 읽기 / 보고서 생성 (WSL 에서도 필요)
+sv-ttk           # GUI 테마 (선택 — 없어도 동작)
