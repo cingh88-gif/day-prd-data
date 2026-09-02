@@ -43,14 +43,39 @@ def target_date(offset_days: int = 1, today: datetime.date | None = None) -> str
     return d.strftime("%Y%m%d")
 
 
-def run_dir_for(export_dir, per) -> Path:
-    """기간별 폴더. 같은 기간을 다시 돌리면 같은 폴더 → 이어받기가 된다.
+def new_run_label(per, now: datetime.datetime | None = None) -> str:
+    """이번 실행의 라벨 = 기간 + **실행 시분초**. 예: '20260901_092048' / '202608_143022'.
 
-    ⚠️ 폴더 이름이 이어받기 키다. day_/month_/range_ 접두어로 갈라 두어야
-      '8월 하루치' 와 '8월 한 달치' 가 같은 폴더에 섞이지 않는다."""
+    ★ 왜 시분초를 붙이나 (사용자 요청 2026-09-02)
+      같은 기간을 **여러 번 돌릴 수 있다.** 시분초가 없으면 뒤 실행이 앞 결과를 덮어쓰거나,
+      이미 있는 파일을 '이미 받음' 으로 건너뛰어 **새 데이터를 못 받는다.**
+      실행마다 폴더가 갈리면 결과를 나란히 두고 비교할 수 있다."""
+    now = now or datetime.datetime.now()
+    return f"{per.label}_{now:%H%M%S}"
+
+
+def find_latest_run_dir(export_dir, per) -> Path | None:
+    """그 기간의 **가장 최근** 수집 폴더(없으면 None). 이어받기·재집계가 쓴다.
+
+    시분초 없는 옛 폴더(day_20260831)도 같이 본다 — 기존 수집을 못 찾으면 안 된다."""
+    base = config.to_local_path(str(export_dir))
+    if not base.exists():
+        return None
+    cands = [d for d in base.glob(f"{per.mode}_{per.label}*") if d.is_dir()]
+    if not cands:
+        return None
+    return sorted(cands, key=lambda d: (d.name, d.stat().st_mtime))[-1]
+
+
+def run_dir_for(export_dir, per, run_label: str | None = None) -> Path:
+    """실행 폴더. 이름이 '<모드>_<기간>_<시분초>' 라 실행마다 갈린다.
+
+    ⚠️ 폴더 이름의 모드 접두어(day_/month_/range_)는 그대로 둔다 —
+      '8월 하루치' 와 '8월 한 달치' 가 섞이면 안 된다."""
     if isinstance(per, str):                    # 'YYYYMMDD' 를 주면 하루로 본다(호환)
         per = P.day(per)
-    return config.to_local_path(str(export_dir)) / per.dirname
+    label = run_label or new_run_label(per)
+    return config.to_local_path(str(export_dir)) / f"{per.mode}_{label}"
 
 
 def _log_row(run_dir: Path, team, status, detail=""):
@@ -186,11 +211,14 @@ def collect_one(top, scfg, dtps, code_h, name_h, team: str, per,
 
 
 def run_collect(per=None, cfg: dict | None = None, log=print,
-                should_stop=None, pump=None) -> dict:
+                should_stop=None, pump=None, resume: bool = False) -> dict:
     """기간 하나를 작업반별로 수집한다. per = period.Period (없으면 설정대로 전날).
 
-    반환: {'run_dir':Path, 'period':Period, 'saved':[...], 'empty':[...],
-           'failed':[...], 'names':{}}
+    resume=True 면 **그 기간의 가장 최근 폴더를 이어서** 채운다(이미 받은 작업반은 건너뜀).
+    기본(False)은 실행 시분초가 붙은 **새 폴더**를 만든다 — 여러 번 돌려도 안 겹친다.
+
+    반환: {'run_dir':Path, 'period':Period, 'run_label':str, 'saved':[...],
+           'empty':[...], 'failed':[...], 'names':{}}
     """
     import excel_grab
 
@@ -200,13 +228,29 @@ def run_collect(per=None, cfg: dict | None = None, log=print,
     elif isinstance(per, str):
         per = P.parse(per)
     teams = config.active_teams(cfg)
-    run_dir = run_dir_for(cfg["export_dir"], per)
+
+    run_dir = None
+    if resume:
+        run_dir = find_latest_run_dir(cfg["export_dir"], per)
+        if run_dir:
+            log(f"   이어받기 — 기존 폴더 사용: {run_dir.name}")
+        else:
+            log("   이어받기를 요청했지만 기존 폴더가 없습니다 — 새로 만듭니다")
+    if run_dir is None:
+        run_dir = run_dir_for(cfg["export_dir"], per)
+    # 폴더 이름에서 이번 실행 라벨을 되찾는다(이어받기면 그 폴더의 라벨을 그대로 쓴다)
+    run_label = run_dir.name.split("_", 1)[1]
     run_dir.mkdir(parents=True, exist_ok=True)
 
     scfg = ip.load_screen()
     kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
     log(f"■ {kind} {per.title} / 작업반 {len(teams)}개 → {run_dir}")
 
+    # ★ 권한이 안 맞으면 아무것도 안 된다 — 창을 열기 전에 먼저 잡는다.
+    ip.preflight(log=log)
+    # ★ 좀비 정리를 guard_excel 보다 **먼저** — 보호 목록이 비었을 때 걷어내야
+    #   사용자 Excel 만 보호 목록에 남는다.
+    excel_grab.sweep_zombie_excel(log=log)
     excel_grab.guard_excel(log=log)
     top = ip.ensure_screen(scfg, log=log)
     ip.focus_window(top)
@@ -252,7 +296,7 @@ def run_collect(per=None, cfg: dict | None = None, log=print,
         if pump:
             pump()
         code = t["code"]
-        out = run_dir / f"progress_{code}_{per.label}.xlsx"
+        out = run_dir / f"progress_{code}_{run_label}.xlsx"
         if out.exists():
             log(f"   ({i}/{len(teams)}) {code} · 이미 있음 — 건너뜀")
             saved.append(code)
@@ -325,5 +369,6 @@ def run_collect(per=None, cfg: dict | None = None, log=print,
     if failed:
         log(f"※ 실패한 작업반: {', '.join(failed)} — 같은 날짜로 다시 실행하면 이어받습니다")
 
-    return {"run_dir": run_dir, "period": per, "ymd": per.label, "saved": saved,
-            "empty": empty, "failed": failed, "names": names}
+    return {"run_dir": run_dir, "period": per, "run_label": run_label,
+            "ymd": per.label, "saved": saved, "empty": empty, "failed": failed,
+            "names": names}

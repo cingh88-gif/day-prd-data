@@ -242,8 +242,9 @@ def aggregate_folder(run_dir: Path, teams: list[dict] | None = None) -> dict:
 
     results, errors = [], []
     for f in sorted(run_dir.glob("progress_*.xlsx")):
-        # progress_<작업반>_<기간라벨>.xlsx — 라벨은 20260831 / 202608 / 20260801-20260815
-        m = re.match(r"progress_(.+?)_(\d{6,8}(?:-\d{8})?)\.xlsx$", f.name)
+        # progress_<작업반>_<기간라벨>[_<시분초>].xlsx
+        #   라벨: 20260831 / 202608 / 20260801-20260815, 뒤에 실행 시분초 _092048 이 붙는다
+        m = re.match(r"progress_(.+?)_(\d{6,8}(?:-\d{8})?(?:_\d{6})?)\.xlsx$", f.name)
         code = m.group(1) if m else f.stem
         try:
             results.append(aggregate_team(f, code, name_map.get(code, "")))

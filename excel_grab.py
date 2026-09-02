@@ -396,3 +396,42 @@ def close_workbook_at(path, log=print) -> bool:
         except Exception:
             continue
     return closed
+
+
+def sweep_zombie_excel(log=print) -> int:
+    r"""**시작 전에** 남아 있는 좀비 EXCEL.EXE 를 정리한다. 반환: 종료한 개수.
+
+    ★ 왜 시작 전인가
+      iERP 엑셀출력은 매번 보이지 않는 Excel 인스턴스를 남긴다. 수집이 중간에 죽거나
+      강제 종료되면 그게 그대로 쌓인다. 다음 실행에서 `_find_export_wb` 가 그 좀비들을
+      먼저 뒤지느라 느려지고, 좀비가 COM 호출을 거부하면(RPC_E_CALL_REJECTED)
+      '엑셀출력이 연 워크북' 을 못 찾아 저장이 통째로 실패한다.
+
+    ⚠️ **사용자 Excel 은 절대 건드리지 않는다.** 종료 대상은 '보이는 창이 하나도 없는'
+      EXCEL.EXE 뿐이다. 사용자가 열어 둔 문서는 반드시 보이는 창을 가진다.
+    ⚠️ guard_excel() **보다 먼저** 부른다. 보호 목록이 비어 있을 때 좀비를 걷어내고,
+      그 뒤 guard_excel 이 '진짜 사용자 Excel' 만 보호 목록에 담게 하기 위해서다.
+    """
+    pids = _excel_pids()
+    if not pids:
+        return 0
+    visible = _visible_window_pids()
+    zombies = sorted(pids - visible)
+    if not zombies:
+        log(f"   좀비 Excel 없음 (실행 중 Excel {len(pids)}개는 모두 창이 있어 보존)")
+        return 0
+
+    import os
+    import signal
+    killed = []
+    for pid in zombies:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except Exception:
+            pass
+    time.sleep(1.0)
+    left = _excel_pids() - _visible_window_pids()
+    log(f"   좀비 Excel {len(killed)}개 종료: {killed}"
+        + (f" (아직 {len(left)}개 남음)" if left else ""))
+    return len(killed)

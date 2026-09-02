@@ -153,8 +153,8 @@ def main():
                                command=lambda: refresh_period())
     v_period_desc = tk.StringVar()
     ttk.Label(f_run, textvariable=v_period_desc, font=("맑은 고딕", 9),
-              foreground="#356").grid(row=2, column=0, columnspan=4, sticky="w",
-                                      padx=6, pady=(0, 4))
+              foreground="#356").grid(row=1, column=3, sticky="w",
+                                      padx=8, pady=(0, 2))
 
     def current_period():
         """지금 화면 설정으로 기간 객체를 만든다. 잘못된 입력이면 ValueError."""
@@ -200,6 +200,12 @@ def main():
     for var in (v_a, v_b):
         var.trace_add("write", refresh_period)
     refresh_period()
+
+    v_resume = tk.BooleanVar(value=False)
+    ttk.Checkbutton(
+        f_run, variable=v_resume,
+        text="이어받기 (새 폴더를 만들지 않고, 같은 기간의 최근 폴더에 못 받은 작업반만 채움)"
+    ).grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
     ttk.Label(f_run, text="저장 폴더").grid(row=3, column=0, sticky="e", padx=4, pady=4)
     v_out = tk.StringVar(value=cfg["export_dir"])
@@ -405,12 +411,13 @@ def main():
             # ※ pywinauto(uia)는 메인 스레드에서 돌아야 한다 → 별도 스레드를 쓰지 않고
             #    root.update 를 pump 로 넘겨 화면이 멈춘 것처럼 보이지 않게 한다.
             r = run_daily.run(per, cfg, do_collect=do_collect, log=log,
-                              should_stop=lambda: stop_flag["stop"], pump=root.update)
+                              should_stop=lambda: stop_flag["stop"], pump=root.update,
+                              resume=bool(v_resume.get()))
             fails = (r["result"] or {}).get("failed", [])
             msg = f"보고서:\n{r['report']}"
             if fails:
                 msg += f"\n\n※ 수집 실패 작업반: {', '.join(fails)}\n" \
-                       "같은 기간으로 다시 실행하면 이어받습니다."
+                       "'이어받기' 를 켜고 다시 실행하면 못 받은 작업반만 채웁니다."
             if cfg.get("open_report"):
                 _open(r["report"])
             (messagebox.showwarning if fails else messagebox.showinfo)("완료", msg)

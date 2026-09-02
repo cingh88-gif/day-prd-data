@@ -129,6 +129,30 @@ def find_hwnd(title_re: str):
     return hits[0] if hits else None
 
 
+def find_hwnds(title_re: str) -> list[int]:
+    """제목 정규식에 맞는 **모든** 최상위 창 핸들. 같은 창이 여러 개 쌓였을 때 쓴다."""
+    try:
+        import win32gui
+    except ImportError:
+        return []
+    pat, hits = re.compile(title_re), []
+
+    def _cb(h, _):
+        try:
+            if win32gui.IsWindowVisible(h):
+                t = re.sub(r"\s*\(응답 없음\)\s*$", "", win32gui.GetWindowText(h) or "")
+                if pat.match(t):
+                    hits.append(h)
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return []
+    return hits
+
+
 def find_children_by_class(top, class_sub: str) -> list[int]:
     """클래스명에 class_sub 가 들어가는 모든 자식 핸들. 화면 좌표순(위→아래, 왼→오른쪽).
 
@@ -257,6 +281,86 @@ def click_button(top_hwnd, name: str, cfg: dict):
 
 
 # ====================================================================
+# 사전점검 — 권한(무결성 레벨)이 맞는가
+# ====================================================================
+INTEGRITY_RID = {"0": ("Untrusted", 0), "4096": ("Low", 1), "8192": ("Medium", 2),
+                 "8448": ("Medium+", 3), "12288": ("High(관리자)", 4),
+                 "16384": ("System", 5)}
+
+
+def process_integrity(pid: int):
+    """(레벨이름, 순위, 관리자상승여부). 못 읽으면 (None, None, None)."""
+    try:
+        import win32api
+        import win32con
+        import win32security
+        h = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        tok = win32security.OpenProcessToken(h, win32con.TOKEN_QUERY)
+        sid = win32security.GetTokenInformation(tok, win32security.TokenIntegrityLevel)[0]
+        rid = win32security.ConvertSidToStringSid(sid).rsplit("-", 1)[-1]
+        name, rank = INTEGRITY_RID.get(rid, (f"RID {rid}", None))
+        elev = bool(win32security.GetTokenInformation(tok, win32security.TokenElevation))
+        return name, rank, elev
+    except Exception:
+        return None, None, None
+
+
+def window_pid(hwnd) -> int | None:
+    try:
+        import win32process
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:
+        return None
+
+
+def preflight(log=print) -> None:
+    """수집 시작 전 1회 점검. 문제가 있으면 **원인을 짚어** RuntimeError 를 던진다.
+
+    ★★ 형제 프로젝트(ierp-manhour) 2026-07-27 실측 사고:
+      iERP 를 **관리자 권한으로** 띄운 상태에서 보통 권한 스크립트를 돌렸더니 UIPI 에 막혀
+      UIA 가 iEMenu 를 **0개**로 보았고, 매달 TimeoutError 로 죽어 **13개월을 통째로
+      건너뛰었다.** 창은 win32 로 멀쩡히 보이므로 증상만 봐서는 원인을 알 수 없다.
+    → 시작 전에 **무결성 레벨을 직접 비교**하고, UIA 핸들 접근까지 확인한다.
+      (2026-09-02 실측 정상값: 이 도구도 iERP 도 둘 다 Medium / 관리자 아님)"""
+    menu = find_hwnd(r"^iEMenu$") or find_hwnd(r".*iEMenu.*")
+    if not menu:
+        raise RuntimeError(
+            "iEMenu 창을 찾을 수 없습니다.\n"
+            "→ iERP 에 로그인해서 메뉴 창(iEMenu)을 띄운 뒤 다시 실행하세요.")
+
+    import os
+    my_name, my_rank, my_elev = process_integrity(os.getpid())
+    pid = window_pid(menu)
+    er_name, er_rank, er_elev = process_integrity(pid) if pid else (None, None, None)
+
+    if my_rank is not None and er_rank is not None:
+        if my_rank < er_rank:
+            raise RuntimeError(
+                f"권한이 맞지 않아 화면 자동화가 차단됩니다(UIPI).\n"
+                f"   이 도구 : {my_name}\n"
+                f"   iERP    : {er_name}   ← 더 높습니다\n"
+                f"→ 해결: ① iERP 를 관리자 권한 **없이** 다시 실행하거나(권장)\n"
+                f"        ② 이 프로그램을 우클릭 → '관리자 권한으로 실행'\n"
+                f"   (Excel 도 iERP 가 띄우므로 셋의 권한이 같아야 합니다.)")
+        if my_rank > er_rank:
+            log(f"   ※ 권한이 다릅니다 — 이 도구 {my_name} / iERP {er_name}. "
+                f"입력은 되지만 Excel COM 이 막힐 수 있습니다. "
+                f"둘 다 관리자 없이 실행하는 것을 권합니다.")
+
+    # UIPI 백스톱 — 레벨을 못 읽었더라도 핸들 접근이 막히면 자동화가 안 된다.
+    try:
+        _ = elem_of(menu).name
+    except Exception as e:
+        raise RuntimeError(
+            f"iEMenu 창은 떠 있는데(hwnd={menu}) UIA 핸들 접근이 막혀 있습니다({e}).\n"
+            f"→ iERP 와 이 도구의 실행 권한이 다를 때 나타납니다. 둘 다 관리자 권한 없이 "
+            f"실행하세요.")
+
+    log(f"   사전점검 OK — iEMenu hwnd={menu} / 권한 {my_name or '?'}"
+        + (f" = iERP {er_name}" if er_name else ""))
+
+
+# ====================================================================
 # 화면 열기 / 재접속
 # ====================================================================
 def force_foreground(hwnd, tries: int = 5, log=print) -> bool:
@@ -328,42 +432,169 @@ def force_foreground(hwnd, tries: int = 5, log=print) -> bool:
     return False
 
 
-def open_via_search(program_id: str, log=print):
-    """iEMenu 에서 F9(메뉴검색) → 프로그램ID → Enter.
+SEARCH_DLG_RE = r"^프로그램 실행$"
+
+
+def _find_search_dialog(timeout: float = 5.0):
+    """F9 로 뜨는 '프로그램 실행' 검색창을 기다린다(없으면 None)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        h = find_hwnd(SEARCH_DLG_RE)
+        if h:
+            return h
+        time.sleep(0.25)
+    return None
+
+
+def _close_search_dialog(log=print) -> int:
+    r"""남아 있는 검색창을 **전부** 닫는다. 반환: 닫은 개수.
+
+    ★★ 2026-09-02 실측 — 이걸 안 해서 화면이 아예 안 열렸다.
+      실패할 때마다 F9 로 새 검색창을 띄우면서 닫지 않았더니 `프로그램 실행` 창이
+      **4개 쌓였고**, 그 모달 창들이 iEMenu 를 막아 어떤 시도도 화면을 열지 못했다.
+      증상은 '열기를 눌러도 화면이 안 뜸' 이라 원인이 전혀 안 보였다.
+    → 시도 전마다 **모두** 닫는다(하나만 닫으면 소용없다)."""
+    closed = 0
+    for _ in range(10):                       # 쌓여 있을 수 있으니 반복
+        hs = find_hwnds(SEARCH_DLG_RE)
+        if not hs:
+            break
+        for h in hs:
+            done = False
+            try:
+                btn = next((b for b in UIAWrapper(UIAElementInfo(h)).descendants(
+                    control_type="Button") if (b.window_text() or "").strip() == "닫기"), None)
+                if btn is not None:
+                    btn.click_input()
+                    done = True
+            except Exception:
+                pass
+            if not done:                      # UIA 로 안 되면 창에 직접 닫기 메시지
+                try:
+                    import win32con
+                    import win32gui
+                    win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+                except Exception:
+                    continue
+            closed += 1
+            time.sleep(0.4)
+    if closed:
+        log(f"      · 남아 있던 검색창 {closed}개를 닫았습니다")
+    return closed
+
+
+def esc_keys(text: str) -> str:
+    r"""send_keys 특수문자 이스케이프.
+
+    ★ 2026-09-02 실측: `공정진척현황(작업보고)` 을 그냥 보냈더니 **괄호가 통째로 사라져**
+      `공정진척현황작업보고` 가 입력됐다. `^ + % ~ ( ) { } [ ]` 는 send_keys 문법 문자다."""
+    special = "^+%~(){}[]"
+    return "".join("{%s}" % c if c in special else c for c in text)
+
+
+def _dialog_combo(dlg):
+    """검색창의 입력 콤보 핸들.
+
+    ⚠️ 이건 Edit 이 아니라 **편집형 ComboBox**(WindowsForms10.COMBOBOX)다.
+      안에 Edit(auto_id 1001)이 들어 있고, 목록 항목은 0개(이력용)다."""
+    try:
+        import win32gui
+    except ImportError:
+        return None
+    found = []
+
+    def _cb(h, _):
+        try:
+            if "COMBOBOX" in win32gui.GetClassName(h).upper():
+                found.append(h)
+        except Exception:
+            pass
+        return True
+    try:
+        win32gui.EnumChildWindows(dlg, _cb, None)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def open_via_search(program_id: str, title_re: str = "", log=print, tries: int = 3):
+    r"""iEMenu 에서 F9(메뉴검색) → 프로그램ID 입력 → **Enter**.
     같은 화면이 이미 떠 있으면 iERP 가 **기존 창을 재사용**한다(중복으로 안 열림).
 
     ⚠️ iEMenu 를 확실히 앞으로 못 가져오면 **키를 아예 보내지 않는다.**
-      엉뚱한 창에 프로그램ID 를 타이핑하는 것보다 실패하는 게 낫다."""
-    import win32gui
+      엉뚱한 창에 프로그램ID 를 타이핑하는 것보다 실패하는 게 낫다.
+
+    ★★ 2026-09-02 실측 — 여기서 반나절을 헤맸다. 확정된 사실:
+      · 검색창에 **'열기' 라는 이름의 Button 이 있지만 그건 콤보박스의 드롭다운 화살표다**
+        (15x18px). 그걸 누르면 목록만 펼쳐지고 **프로그램은 안 열린다.**
+        UIA 가 콤보 드롭다운 버튼에 붙이는 표준 한국어 이름이 하필 '열기' 다.
+      · 이 창에 확인/실행 버튼은 없다. **제출 수단은 Enter 뿐이다.**
+      · 실패한 시도의 검색창을 안 닫으면 **창이 쌓여**(4개까지 봤다) iEMenu 가 막혀
+        그 뒤 어떤 시도도 화면을 열지 못한다. 증상이 원인과 전혀 안 닮아서 오진하기 쉽다.
+      · 입력은 Edit 이 아니라 편집형 ComboBox 다. 좌표로 텍스트 영역을 클릭해 포커스를 준다.
+    → 순서: 남은 창 전부 닫기 → F9 → 창 확인 → 콤보 클릭 → 입력 → **값 확인** → Enter
+            → 화면 확인. 실패하면 창을 닫고 다시.
+    """
     menu = find_hwnd(r"^iEMenu$") or find_hwnd(r".*iEMenu.*")
     if not menu:
         raise RuntimeError("iEMenu 창을 찾지 못했습니다 — iERP 에 로그인돼 있는지 확인하세요.")
-    if not force_foreground(menu, log=log):
-        raise RuntimeError(
-            "iEMenu 를 앞으로 가져오지 못했습니다 — 키 입력을 보내지 않고 멈춥니다.\n"
-            "  (다른 창이 포커스를 붙잡고 있습니다. 전체화면 앱이나 대화상자를 닫고 "
-            "다시 실행하세요.)")
-    time.sleep(0.5)
-    send_keys("{F9}")
-    time.sleep(0.9)
-    send_keys("^a{DELETE}")
-    send_keys(program_id, with_spaces=True, pause=0.03)
-    time.sleep(0.4)
-    send_keys("{ENTER}")
-    time.sleep(3.0)
-    # ★ 이 창은 Enter 를 먹지 않는 경우가 있다 — 검색창이 남아 있으면 '열기' 를 직접 누른다.
-    dlg = find_hwnd(r"^프로그램 실행$")
-    if dlg:
+
+    for attempt in range(1, tries + 1):
+        _close_search_dialog(log=log)          # ★ 안 닫으면 창이 쌓여 전부 막힌다
+        if not force_foreground(menu, log=log):
+            raise RuntimeError(
+                "iEMenu 를 앞으로 가져오지 못했습니다 — 키 입력을 보내지 않고 멈춥니다.\n"
+                "  (다른 창이 포커스를 붙잡고 있습니다. 전체화면 앱이나 대화상자를 닫고 "
+                "다시 실행하세요.)")
+        time.sleep(0.4)
+
+        # ① 검색창을 띄우고 **떴는지 확인**
+        send_keys("{F9}")
+        dlg = _find_search_dialog(5.0)
+        if not dlg:
+            log(f"      · F9 로 검색창이 안 떴습니다({attempt}/{tries})")
+            continue
+
+        # ② 콤보에 포커스를 주고 입력한 뒤 **들어갔는지 확인**
+        force_foreground(dlg, tries=2, log=log)
+        time.sleep(0.4)
+        combo = _dialog_combo(dlg)
         try:
-            root = UIAElementInfo(dlg)
-            btn = next((b for b in UIAWrapper(root).descendants(control_type="Button")
-                        if (b.window_text() or "").strip() == "열기"), None)
-            if btn is not None:
-                log("      · 검색창이 남아 있어 '열기' 를 누릅니다")
-                btn.click_input()
-                time.sleep(3.0)
+            if combo:
+                UIAWrapper(elem_of(combo)).click_input(coords=(40, 10))   # 텍스트 영역
+                time.sleep(0.3)
+            send_keys("^a{DELETE}")
+            time.sleep(0.2)
+            send_keys(esc_keys(program_id), with_spaces=True, pause=0.05)
+            time.sleep(0.7)
         except Exception as e:
-            log(f"      · '열기' 클릭 실패({e})")
+            log(f"      · 프로그램ID 입력 예외({e})")
+            _close_search_dialog(log=log)
+            continue
+        got = _edit_text(combo) if combo else program_id
+        if combo and got.strip().upper() != program_id.strip().upper():
+            log(f"      · 프로그램ID 가 안 들어갔습니다(화면값 {got!r})({attempt}/{tries})")
+            _close_search_dialog(log=log)
+            continue
+
+        # ③ **Enter 로 제출** — '열기' 버튼은 콤보 드롭다운이라 누르면 안 된다
+        send_keys("{ENTER}")
+
+        # ④ 화면이 **실제로 떴는지** 확인
+        for i in range(20):
+            time.sleep(1.0)
+            h = find_hwnd(title_re) if title_re else None
+            if h:
+                log(f"      · 화면 열림({i + 1}초, hwnd={h})")
+                return h
+        log(f"      · Enter 를 눌렀지만 화면이 뜨지 않았습니다({attempt}/{tries})")
+        _close_search_dialog(log=log)
+
+    raise RuntimeError(
+        f"iEMenu 검색창으로 {program_id} 를 열지 못했습니다({tries}회 시도).\n"
+        f"  · iERP 로그인 상태를 확인하세요\n"
+        f"  · 프로그램ID 는 버전 접미사까지 필요합니다(예: PM60250Rv3)\n"
+        f"  · iEMenu 에서 직접 F9 로 열리는지 확인해 보세요")
 
 
 def ensure_screen(cfg: dict, log=print, busy_wait: float = QUERY_TIMEOUT):
@@ -377,7 +608,10 @@ def ensure_screen(cfg: dict, log=print, busy_wait: float = QUERY_TIMEOUT):
             wait_responsive(h, timeout=busy_wait, quiet=3.0)
         return h
     log(f"   화면 자동 열기(F9 검색): {cfg['program_id']}")
-    open_via_search(cfg["program_id"], log=log)
+    h = open_via_search(cfg["program_id"], cfg["title_re"], log=log)
+    if h:
+        wait_responsive(h, timeout=60, quiet=2.0)
+        return h
     for _ in range(10):
         h = find_hwnd(cfg["title_re"])
         if h:

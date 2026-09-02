@@ -7,10 +7,13 @@ r"""
   py run_daily.py --last-month             # ★ 전월 전체 — 월마감 스케줄이 쓰는 형태
   py run_daily.py --from 2026-08-01 --to 2026-08-15   # 직접 기간
   py run_daily.py --teams M2105,M1101      # 일부 작업반만(시험용)
+  py run_daily.py --resume                 # 앞서 실패한 실행을 이어받기(새 폴더 대신)
   py run_daily.py --no-collect --month 2026-08        # 받아 둔 폴더로 집계·보고서만 다시
   py run_daily.py --auto                   # 스케줄러용(보고서 자동열기 안 함)
 
 기간은 화면의 **개시예정일** 에 들어간다(작업일자·보고일자가 아니다).
+결과는 실행할 때마다 **시분초가 붙은 새 폴더**에 쌓인다(같은 기간을 여러 번 돌려도 안 겹친다).
+중간에 실패한 실행을 이어서 채우려면 `--resume` 을 붙인다.
 --no-collect 는 WSL 에서도 돈다(수집만 Windows 전용).
 """
 from __future__ import annotations
@@ -51,7 +54,7 @@ def make_logger(log_path: Path | None, echo=True):
 
 
 def run(per=None, cfg: dict | None = None, do_collect: bool = True,
-        log=print, should_stop=None, pump=None) -> dict:
+        log=print, should_stop=None, pump=None, resume: bool = False) -> dict:
     """반환: {'ok':bool, 'report':Path|None, 'agg':dict|None, 'result':dict|None, 'summary':str}"""
     cfg = cfg or config.load()
     if per is None:
@@ -62,14 +65,22 @@ def run(per=None, cfg: dict | None = None, do_collect: bool = True,
 
     result = None
     if do_collect:
-        result = collect.run_collect(per, cfg, log=log, should_stop=should_stop, pump=pump)
+        result = collect.run_collect(per, cfg, log=log, should_stop=should_stop,
+                                     pump=pump, resume=resume)
         run_dir = result["run_dir"]
+        run_label = result["run_label"]
     else:
-        run_dir = collect.run_dir_for(cfg["export_dir"], per)
+        # 재집계는 **그 기간의 가장 최근 폴더**를 쓴다(실행마다 폴더가 갈리므로).
+        run_dir = collect.find_latest_run_dir(cfg["export_dir"], per)
+        if run_dir is None:
+            raise RuntimeError(
+                f"{per.title} 의 수집 폴더를 찾지 못했습니다.\n"
+                f"  먼저 수집을 돌리거나 기간을 확인하세요"
+                f"(찾은 위치: {config.to_local_path(cfg['export_dir'])}).")
+        run_label = run_dir.name.split("_", 1)[1]
         log(f"■ 수집 생략 — 기존 폴더로 집계합니다: {run_dir}")
     if not run_dir.exists():
-        raise RuntimeError(f"수집 폴더가 없습니다: {run_dir}\n"
-                           f"  먼저 수집을 돌리거나 --date 를 확인하세요.")
+        raise RuntimeError(f"수집 폴더가 없습니다: {run_dir}")
 
     # ── 집계 + 보고서 ─────────────────────────────────────────────
     log("\n■ 집계 · 보고서 생성")
@@ -85,7 +96,7 @@ def run(per=None, cfg: dict | None = None, do_collect: bool = True,
                     and t["code"] not in (result or {}).get("empty", [])
                     and t["code"] not in (result or {}).get("failed", [])],
     }
-    out = run_dir / f"{kind}_공정진척_{per.label}.xlsx"
+    out = run_dir / f"{kind}_공정진척_{run_label}.xlsx"
     if out.exists():
         # 지난 실행에서 열어 본 보고서가 Excel 에 물려 있으면 같은 이름으로 저장이 안 된다.
         try:
@@ -100,13 +111,15 @@ def run(per=None, cfg: dict | None = None, do_collect: bool = True,
     log(summary)
     log(f"\n보고서: {out}")
     return {"ok": True, "report": out, "agg": agg, "result": result,
-            "summary": summary, "run_dir": run_dir, "period": per, "ymd": per.label}
+            "summary": summary, "run_dir": run_dir, "period": per,
+            "run_label": run_label, "ymd": per.label}
 
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     auto = "--auto" in argv
     do_collect = "--no-collect" not in argv
+    resume = "--resume" in argv
 
     def opt(name):
         return argv[argv.index(name) + 1] if name in argv else None
@@ -147,7 +160,7 @@ def main(argv=None):
     kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
     log(f"=== {kind} 공정진척 자동 실행 시작 ({'스케줄' if auto else '수동'}) — {per.title} ===")
     try:
-        r = run(per, cfg, do_collect=do_collect, log=log)
+        r = run(per, cfg, do_collect=do_collect, log=log, resume=resume)
         fails = (r["result"] or {}).get("failed", [])
         log(f"=== 완료 === 로그: {log_path}")
         if not auto and cfg.get("open_report"):
