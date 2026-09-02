@@ -10,6 +10,8 @@ r"""
   py run_daily.py --resume                 # 앞서 실패한 실행을 이어받기(새 폴더 대신)
   py run_daily.py --no-collect --month 2026-08        # 받아 둔 폴더로 집계·보고서만 다시
   py run_daily.py --auto                   # 스케줄러용(보고서 자동열기 안 함)
+                                           #   실패하면 10분 뒤 이어받기로 재시도(최대 3회)
+  py run_daily.py --auto --retry 5 --retry-wait 15   # 재시도 횟수/간격 조정
 
 기간은 화면의 **개시예정일** 에 들어간다(작업일자·보고일자가 아니다).
 결과는 실행할 때마다 **시분초가 붙은 새 폴더**에 쌓인다(같은 기간을 여러 번 돌려도 안 겹친다).
@@ -21,6 +23,7 @@ from __future__ import annotations
 import datetime
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -146,6 +149,17 @@ def main(argv=None):
         print(f"기간 지정 오류: {e}")
         return 2
 
+    def optint(name, default):
+        try:
+            return int(argv[argv.index(name) + 1]) if name in argv else default
+        except (ValueError, IndexError):
+            return default
+
+    # ★ 스케줄 실행은 사람이 안 볼 때 돈다 — 한 번 삐끗했다고 그날치를 통째로 잃으면 안 된다.
+    #   실패하거나 일부 작업반이 빠지면 잠시 뒤 **이어받기로** 다시 시도한다.
+    max_try = optint("--retry", 3 if auto else 1)
+    retry_wait = optint("--retry-wait", 10) * 60
+
     cfg = config.load()
     if "--teams" in argv:            # 시험용 — 일부 작업반만 (예: --teams M2105,M1101)
         want = {c.strip().upper() for c in argv[argv.index("--teams") + 1].split(",") if c.strip()}
@@ -159,21 +173,41 @@ def main(argv=None):
     log, fh = make_logger(log_path, echo=True)
     kind = {"day": "일마감", "month": "월마감", "range": "기간"}[per.mode]
     log(f"=== {kind} 공정진척 자동 실행 시작 ({'스케줄' if auto else '수동'}) — {per.title} ===")
+    if max_try > 1:
+        log(f"    (실패하면 {retry_wait // 60}분 뒤 이어받기로 다시 시도, 최대 {max_try}회)")
     try:
-        r = run(per, cfg, do_collect=do_collect, log=log, resume=resume)
-        fails = (r["result"] or {}).get("failed", [])
-        log(f"=== 완료 === 로그: {log_path}")
-        if not auto and cfg.get("open_report"):
+        last_err = None
+        for n in range(1, max_try + 1):
+            if n > 1:
+                log(f"\n=== {n}/{max_try}회차 재시도 (이어받기) ===")
             try:
-                import os
-                os.startfile(str(r["report"]))         # Windows 에서만 존재
-            except Exception:
-                pass
-        return 3 if fails else 0                       # 3 = 일부 작업반 실패
-    except Exception as e:
-        log(f"※ 실패: {e}")
-        log(traceback.format_exc())
-        return 1
+                # 2회차부터는 **이어받기** — 앞서 받아 둔 작업반을 다시 받지 않는다.
+                r = run(per, cfg, do_collect=do_collect, log=log,
+                        resume=resume or n > 1)
+                fails = (r["result"] or {}).get("failed", [])
+                if not fails:
+                    log(f"=== 완료 === 로그: {log_path}")
+                    if not auto and cfg.get("open_report"):
+                        try:
+                            import os
+                            os.startfile(str(r["report"]))     # Windows 에서만 존재
+                        except Exception:
+                            pass
+                    return 0
+                last_err = f"작업반 {len(fails)}개 실패: {', '.join(fails)}"
+                log(f"※ {last_err}")
+            except Exception as e:
+                last_err = str(e)
+                log(f"※ 실패: {e}")
+                log(traceback.format_exc())
+
+            if n < max_try:
+                log(f"   {retry_wait // 60}분 대기 후 다시 시도합니다…")
+                time.sleep(retry_wait)
+
+        log(f"=== {max_try}회 시도 후에도 끝내지 못했습니다 === 로그: {log_path}")
+        log(f"    마지막 사유: {last_err}")
+        return 3 if "작업반" in (last_err or "") else 1
     finally:
         if fh:
             fh.close()

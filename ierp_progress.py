@@ -492,6 +492,39 @@ def esc_keys(text: str) -> str:
     return "".join("{%s}" % c if c in special else c for c in text)
 
 
+def focus_control(hwnd, log=print) -> bool:
+    r"""컨트롤에 **좌표 클릭 없이** 키보드 포커스를 준다.
+
+    ★★ 2026-09-02 11:00 스케줄 실행 실패의 원인.
+      검색창 콤보에 `click_input(coords=...)` 으로 포커스를 주고 있었는데, 물리 좌표 클릭은
+      **그 지점을 다른 창이 덮고 있으면 엉뚱한 창을 누른다.** 사용자가 회의로 자리를 비운
+      사이(잠금도 아니었고 화면도 안 꺼졌다) 실행됐는데, 타이핑이 콤보에 하나도 안 들어가
+      3회 재시도가 20초 만에 소진됐다. 이 검색창은 화면 오른쪽 끝(x 1515~1925, 화면폭 1920)
+      에 떠서 다른 창에 덮이기 쉽다.
+    → `AttachThreadInput` 으로 그 창의 입력 큐에 붙어 `SetFocus` 를 건다. 좌표와 무관하고
+      창이 가려져 있어도 동작한다."""
+    try:
+        import ctypes
+        import win32gui
+    except ImportError:
+        return False
+    user32 = ctypes.windll.user32
+    try:
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = bool(user32.AttachThreadInput(tid, cur, True)) if tid != cur else False
+        try:
+            user32.SetFocus(hwnd)
+            time.sleep(0.15)
+            return user32.GetFocus() == hwnd or win32gui.GetFocus() == hwnd
+        finally:
+            if attached:
+                user32.AttachThreadInput(tid, cur, False)
+    except Exception as e:
+        log(f"      · 포커스 지정 예외({e})")
+        return False
+
+
 def _dialog_combo(dlg):
     """검색창의 입력 콤보 핸들.
 
@@ -517,7 +550,7 @@ def _dialog_combo(dlg):
     return found[0] if found else None
 
 
-def open_via_search(program_id: str, title_re: str = "", log=print, tries: int = 3):
+def open_via_search(program_id: str, title_re: str = "", log=print, tries: int = 5):
     r"""iEMenu 에서 F9(메뉴검색) → 프로그램ID 입력 → **Enter**.
     같은 화면이 이미 떠 있으면 iERP 가 **기존 창을 재사용**한다(중복으로 안 열림).
 
@@ -559,20 +592,30 @@ def open_via_search(program_id: str, title_re: str = "", log=print, tries: int =
         force_foreground(dlg, tries=2, log=log)
         time.sleep(0.4)
         combo = _dialog_combo(dlg)
-        try:
-            if combo:
-                UIAWrapper(elem_of(combo)).click_input(coords=(40, 10))   # 텍스트 영역
+        # 포커스 → 입력 → 확인을 방법을 바꿔 가며 두 번 해 본다.
+        #   ① 핸들 포커스(좌표 무관, 가려져 있어도 됨)  ② 좌표 클릭(폴백)
+        got = program_id
+        typed_ok = combo is None
+        for how in ("focus", "click"):
+            if typed_ok:
+                break
+            try:
+                if how == "focus":
+                    focus_control(combo, log=log)
+                else:
+                    UIAWrapper(elem_of(combo)).click_input(coords=(40, 10))
                 time.sleep(0.3)
-            send_keys("^a{DELETE}")
-            time.sleep(0.2)
-            send_keys(esc_keys(program_id), with_spaces=True, pause=0.05)
-            time.sleep(0.7)
-        except Exception as e:
-            log(f"      · 프로그램ID 입력 예외({e})")
-            _close_search_dialog(log=log)
-            continue
-        got = _edit_text(combo) if combo else program_id
-        if combo and got.strip().upper() != program_id.strip().upper():
+                send_keys("^a{DELETE}")
+                time.sleep(0.2)
+                send_keys(esc_keys(program_id), with_spaces=True, pause=0.05)
+                time.sleep(0.7)
+            except Exception as e:
+                log(f"      · 프로그램ID 입력 예외({how}: {e})")
+                continue
+            got = _edit_text(combo)
+            if got.strip().upper() == program_id.strip().upper():
+                typed_ok = True
+        if not typed_ok:
             log(f"      · 프로그램ID 가 안 들어갔습니다(화면값 {got!r})({attempt}/{tries})")
             _close_search_dialog(log=log)
             continue
